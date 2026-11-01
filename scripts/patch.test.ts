@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseDiffLines, annotateDiff, anchorFindings } from "./difflines.ts";
 import {
-  applySeverityPolicy, findingRejectReason, githubReviewPayload, isTypingStyleNit, parseResponse,
-  renderFinding, repairFindingsPrompt, reviewOverviewBody, toReviewComment,
+  applySeverityPolicy, findingRejectReason, githubReviewPayload, isTypingStyleNit, parseFindingMarker,
+  parseResponse, renderFinding, repairFindingsPrompt, reviewOverviewBody, toReviewComment,
 } from "./findings.ts";
 
 const DIFF = [
@@ -153,6 +153,22 @@ test("renderFinding picks a fence longer than any backtick run in the suggestion
   assert.match(body, /\n`````\n/);
 });
 
+test("renderFinding uses Copilot-style severity, omits confidence %, and keeps a marker", () => {
+  const body = renderFinding(sig({
+    id: "RB1",
+    title: "Truthiness bug",
+    description: "`token.pan` of `0` is ignored.",
+    recommendation: "Use an explicit `!== undefined` check.",
+  }) as any, 2000);
+  assert.match(body, /<div align="right"><b>High<\/b><\/div>/);
+  assert.match(body, /\*\*Truthiness bug\*\*/);
+  assert.match(body, /token\.pan/);
+  assert.match(body, /\*\*Fix:\*\* Use an explicit/);
+  assert.doesNotMatch(body, /% confidence/);
+  assert.doesNotMatch(body, /🚨|⚠️/);
+  assert.equal(parseFindingMarker(body), "RB1");
+});
+
 test("renderFinding keeps a short suggestion by shrinking long prose first", () => {
   const longDesc = "D".repeat(900);
   const body = renderFinding(sig({
@@ -166,6 +182,7 @@ test("renderFinding keeps a short suggestion by shrinking long prose first", () 
   // Long prose was compressed (not left intact) so the suggestion could stay.
   assert.ok(!body.includes(longDesc));
   assert.match(body, /D…/);
+  assert.equal(parseFindingMarker(body), "S");
 });
 
 test("renderFinding omits only when the suggestion block itself cannot fit", () => {
@@ -179,11 +196,13 @@ test("renderFinding omits only when the suggestion block itself cannot fit", () 
   assert.doesNotMatch(body, /```suggestion/);
   assert.match(body, /Short problem statement/);
   assert.ok(body.length <= 800);
+  assert.equal(parseFindingMarker(body), "S");
 });
 
-test("review overview body summarizes inline findings; below-gate stay off the PR", () => {
+test("review overview body uses Copilot-style sections; below-gate stay off the PR", () => {
   const empty = reviewOverviewBody([], 0.85);
-  assert.match(empty, /No inline findings met the gate/);
+  assert.match(empty, /## Pull request overview/);
+  assert.match(empty, /No inline findings met the publish gate/);
   assert.doesNotMatch(empty, /Also noted/);
   const emptyWithBelow = reviewOverviewBody([], 0.85, { belowGateCount: 3 });
   assert.match(emptyWithBelow, /3 other findings were scored but stayed below the publish gate/);
@@ -191,16 +210,29 @@ test("review overview body summarizes inline findings; below-gate stay off the P
     sig({ severity: "high", title: "CRLF blank context", file: "scripts/difflines.ts", line: 34 }),
     sig({ severity: "critical", confidence: 0.95, title: "Fence length", file: "scripts/findings.ts", line: 128 }),
   ] as any, 0.85, {
+    title: "Fix CRLF and fence length",
+    body: "This PR hardens the diff parser.\n\n## Changes\n- Fix CRLF context\n- Fix fence length\n",
+    files: [
+      { path: "scripts/difflines.ts", reviewed: true, comments: 1 },
+      { path: "scripts/findings.ts", reviewed: true, comments: 1 },
+      { path: "other.py", reviewed: false, comments: 0, note: "not on reviewed diff" },
+    ],
     unanchored: [sig({
       confidence: 0.9, title: "Unanchored high", file: "other.py", line: 1,
       description: "Cannot attach this line.", recommendation: "Move the change onto an added line.",
     }) as any],
   });
-  assert.match(body, /## ReviewBrief/);
-  assert.match(body, /2 inline findings \(critical\/high with confidence ≥ 0\.85\)/);
-  assert.match(body, /\| critical \| 1 \|/);
-  assert.match(body, /\| high \| 1 \|/);
-  assert.match(body, /\*\*CRLF blank context\*\* \(`scripts\/difflines\.ts:34`\)/);
+  assert.match(body, /## Pull request overview/);
+  assert.match(body, /Fix CRLF and fence length/);
+  assert.match(body, /This PR hardens the diff parser\./);
+  assert.match(body, /\*\*Changes:\*\*/);
+  assert.match(body, /- Fix CRLF context/);
+  assert.match(body, /ReviewBrief reviewed 2 out of 3 changed files/);
+  assert.match(body, /generated 2 comments/);
+  assert.match(body, /Show a summary per file/);
+  assert.match(body, /`scripts\/difflines\.ts`: reviewed, 1 comment/);
+  assert.doesNotMatch(body, /\| Severity \| Count \|/);
+  assert.doesNotMatch(body, /confidence ≥/);
   assert.match(body, /### Could not place inline/);
   assert.match(body, /\*\*Unanchored high\*\*/);
   assert.match(body, /Cannot attach this line\./);
@@ -214,9 +246,13 @@ test("review overview body summarizes inline findings; below-gate stay off the P
   ] as any, 0.85, undefined, undefined, [
     sig({ file: "other.py", line: 1, title: "Unanchored high", confidence: 0.9, description: "d", recommendation: "fix it" }) as any,
     sig({ file: "other.py", line: 2, title: "Unanchored medium", severity: "medium", confidence: 0.99, description: "skip" }) as any,
-  ]);
-  assert.match(payload.body, /1 inline finding/);
-  assert.match(payload.body, /\*\*Keep\*\*/);
+  ], false, {
+    title: "Keep the gate",
+    files: [{ path: "a.py", reviewed: true, comments: 1 }],
+  });
+  assert.match(payload.body, /## Pull request overview/);
+  assert.match(payload.body, /generated 1 comment/);
+  assert.doesNotMatch(payload.body, /\*\*Keep\*\*/); // findings live on inline threads, not the overview list
   assert.doesNotMatch(payload.body, /Also noted/);
   assert.doesNotMatch(payload.body, /\*\*Drop\*\*/);
   assert.doesNotMatch(payload.body, /\*\*Low severity drop\*\*/);
@@ -226,6 +262,8 @@ test("review overview body summarizes inline findings; below-gate stay off the P
   assert.match(payload.body, /\*\*Unanchored high\*\*/);
   assert.match(payload.body, /\*\*Recommendation:\*\* fix it/);
   assert.equal(payload.comments.length, 1);
+  assert.match(payload.comments[0].body, /<div align="right"><b>High<\/b><\/div>/);
+  assert.doesNotMatch(payload.comments[0].body, /% confidence/);
   const capped = githubReviewPayload([
     sig({ confidence: 0.95, title: "First", line: 2 }),
     sig({ confidence: 0.9, title: "Second", line: 3, description: "Over cap.", recommendation: "Raise the cap." }),

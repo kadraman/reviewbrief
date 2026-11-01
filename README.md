@@ -3,7 +3,7 @@
 AI-powered pull request review for GitHub that works with **any model** (OpenAI, Claude, DeepSeek, OpenRouter, Ollama, anything OpenAI-compatible), **doesn't truncate large PRs**, and writes a **fix brief**: a markdown prompt you can hand to an AI coding assistant to apply the fixes.
 
 - **Large PRs:** the diff is split per file (and per hunk for huge files), reviewed in batches, then merged into one review. Skipped files and failed batches are listed in the comment, never silently dropped.
-- **Structured findings:** the model returns canonical Findings, which ReviewBrief renders into concise inline comments and GitHub suggestions.
+- **Structured findings:** the model returns canonical Findings, which ReviewBrief renders into Copilot-style overview + inline comments (severity top-right) and GitHub suggestions.
 - **Any provider:** two protocols cover nearly everything: `openai` (OpenAI-compatible) and `anthropic`.
 - **Fix brief:** `fix-brief.md` lists each actionable finding with file, problem, suggested fix and a "done when" check, plus rules that tell the assistant to verify each finding before changing anything.
 - **TypeScript runtime:** the review pipeline, canonical Finding model, and renderers run on Node.js 22 without third-party packages.
@@ -16,6 +16,7 @@ scripts/reviewbrief.ts     review engine (also runs standalone)
 scripts/context.ts         per-batch reference context (PR overview, guidance, symbol usages)
 scripts/compute-diffs.sh   review diff + GitHub PR anchor diff for Actions
 scripts/findings.ts        canonical Finding types and GitHub renderer
+scripts/attach-replies.ts  attach per-finding PR reply commands to fix-brief.md
 scripts/review-pr.sh       run it against an existing PR from your machine
 examples/reviewbrief.yml   workflow that uses the action
 .env.example               config template for local runs
@@ -132,7 +133,7 @@ The PR comment links to the `fix-brief.md` artifact (kept 14 days). Download it,
 claude -p "$(cat fix-brief.md)"
 ```
 
-or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the assistant to verify each finding first, keep changes minimal, run the tests, and report what it fixed and skipped. The findings come from an LLM reading diffs in separate batches, so **read the brief before running it** and review the resulting changes like any other PR.
+or paste/attach it in Copilot, Cursor, or a chat session. The brief tells the assistant to verify each finding first, keep changes minimal, run the tests, and **comment on the pull request for every finding** (what it fixed, or why it skipped it). When ReviewBrief could post an inline thread, the brief includes a `gh` reply command for that comment; otherwise it falls back to a new PR comment. The findings come from an LLM reading diffs in separate batches, so **read the brief before running it** and review the resulting changes like any other PR.
 
 ---
 

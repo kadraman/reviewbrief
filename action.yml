@@ -169,28 +169,8 @@ runs:
         fi
         echo "review_payload_path=$out/review-payload.json" >> "$GITHUB_OUTPUT"
 
-    - name: Upload fix brief
-      id: upload
-      if: steps.review.outputs.has_brief == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: fix-brief-pr-${{ github.event.pull_request.number }}
-        path: ${{ steps.review.outputs.brief_path }}
-        retention-days: 14
-
-    - name: Upload debug artifacts
-      if: always() && inputs.debug-artifacts == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: reviewbrief-debug-pr-${{ github.event.pull_request.number }}
-        path: |
-          ${{ runner.temp }}/reviewbrief/findings.json
-          ${{ runner.temp }}/reviewbrief/review-payload.json
-          ${{ runner.temp }}/reviewbrief/scope.txt
-        retention-days: 7
-        if-no-files-found: ignore
-
     - name: Post review comment
+      id: post
       if: inputs.post-comment == 'true' && github.event.pull_request
       shell: bash
       env:
@@ -198,20 +178,30 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_ACTION: ${{ github.event.action }}
         REVIEW_PAYLOAD: ${{ steps.review.outputs.review_payload_path }}
-        BRIEF_URL: ${{ steps.upload.outputs.artifact-url }}
         REPO: ${{ github.repository }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        append_brief_to_payload() {
-          if [ -n "${BRIEF_URL:-}" ]; then
-            node --input-type=module -e '
+        OUT="$RUNNER_TEMP/reviewbrief"
+        POSTED=false
+        REVIEW_ID=""
+        echo "[]" > "$OUT/posted-comments.json"
+        save_comments() {
+          local id="$1"
+          if [ -z "$id" ]; then echo "[]" > "$OUT/posted-comments.json"; return; fi
+          if RAW="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews/$id/comments")"; then
+            printf '%s' "$RAW" | node --input-type=module -e '
               import { readFileSync, writeFileSync } from "node:fs";
-              const path = process.argv[1], url = process.argv[2];
-              const payload = JSON.parse(readFileSync(path, "utf8"));
-              payload.body = `${payload.body.trimEnd()}\n\n**Fix brief for an AI assistant:** [download fix-brief.md](${url})\n`;
-              writeFileSync(path, JSON.stringify(payload, null, 2));
-            ' "$REVIEW_PAYLOAD" "$BRIEF_URL"
+              const raw = readFileSync(0, "utf8").trim();
+              let rows = [];
+              try { rows = JSON.parse(raw || "[]"); } catch { rows = []; }
+              if (!Array.isArray(rows)) rows = [];
+              writeFileSync(process.argv[1], JSON.stringify(rows.map((c) => ({
+                id: c.id, body: c.body || "", path: c.path, line: c.line ?? null,
+              })), null, 2));
+            ' "$OUT/posted-comments.json"
+          else
+            echo "[]" > "$OUT/posted-comments.json"
           fi
         }
         # Decide whether the gated payload has anything worth posting.
@@ -229,39 +219,114 @@ runs:
         if [ "$HAS_CONTENT" != "yes" ]; then
           if [ "${PR_ACTION:-}" = "synchronize" ]; then
             echo "Nothing met the publish gate on this push; leaving the earlier review in place."
-            exit 0
-          fi
-          append_brief_to_payload
-          # opened / reopened: post the gated overview so the first run is visible.
-          if gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" --input "$REVIEW_PAYLOAD"; then
-            echo "Posted empty-gate PR review (no inline findings)."
           else
+            # opened / reopened: post the gated overview so the first run is visible.
+            if REVIEW_JSON="$(gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" --input "$REVIEW_PAYLOAD")"; then
+              REVIEW_ID="$(printf '%s' "$REVIEW_JSON" | node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(0,"utf8")).id || "")')"
+              POSTED=true
+              echo "Posted empty-gate PR review (no inline findings)."
+              save_comments "$REVIEW_ID"
+            else
+              node --input-type=module -e '
+                import { readFileSync, writeFileSync } from "node:fs";
+                const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
+                writeFileSync(process.argv[2], payload.body);
+              ' "$REVIEW_PAYLOAD" "$OUT/comment.md"
+              gh pr comment "$PR_NUMBER" --body-file "$OUT/comment.md"
+              echo "Posted empty-gate summary comment."
+            fi
+          fi
+        else
+          # Prefer a single PR review (overview + inline threads). Fall back to the
+          # gated payload body (never review.md) if create-review fails.
+          if REVIEW_JSON="$(gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" --input "$REVIEW_PAYLOAD")"; then
+            REVIEW_ID="$(printf '%s' "$REVIEW_JSON" | node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(0,"utf8")).id || "")')"
+            POSTED=true
+            echo "Posted PR review with $INLINE_COUNT inline comment(s)."
+            save_comments "$REVIEW_ID"
+          else
+            echo "::warning::create-review failed; posting gated payload as an issue comment."
             node --input-type=module -e '
               import { readFileSync, writeFileSync } from "node:fs";
               const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-              writeFileSync(process.argv[2], payload.body);
-            ' "$REVIEW_PAYLOAD" "$RUNNER_TEMP/reviewbrief/comment.md"
-            gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/reviewbrief/comment.md"
-            echo "Posted empty-gate summary comment."
+              const parts = [payload.body.trimEnd()];
+              for (const c of payload.comments || []) {
+                parts.push("", `---`, "", `**\`${c.path}:${c.line}\`**`, "", c.body);
+              }
+              writeFileSync(process.argv[2], parts.join("\n") + "\n");
+            ' "$REVIEW_PAYLOAD" "$OUT/comment.md"
+            gh pr comment "$PR_NUMBER" --body-file "$OUT/comment.md"
+            echo "Posted gated summary comment with $INLINE_COUNT finding(s)."
           fi
+        fi
+        echo "posted=$POSTED" >> "$GITHUB_OUTPUT"
+        echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Attach fix-brief report-back
+      if: steps.review.outputs.has_brief == 'true'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BRIEF_PATH: ${{ steps.review.outputs.brief_path }}
+      run: |
+        set -euo pipefail
+        OUT="$RUNNER_TEMP/reviewbrief"
+        TARGETS="$OUT/fix-brief-targets.json"
+        COMMENTS="$OUT/posted-comments.json"
+        if [ ! -f "$COMMENTS" ]; then echo "[]" > "$COMMENTS"; fi
+        if [ ! -f "$TARGETS" ]; then
+          echo "No fix-brief-targets.json; skipping report-back attach."
           exit 0
         fi
-        append_brief_to_payload
-        # Prefer a single PR review (overview + inline threads). Fall back to the
-        # gated payload body (never review.md) if create-review fails.
-        if gh api --method POST "repos/$REPO/pulls/$PR_NUMBER/reviews" --input "$REVIEW_PAYLOAD"; then
-          echo "Posted PR review with $INLINE_COUNT inline comment(s)."
-        else
-          echo "::warning::create-review failed; posting gated payload as an issue comment."
-          node --input-type=module -e '
-            import { readFileSync, writeFileSync } from "node:fs";
-            const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
-            const parts = [payload.body.trimEnd()];
-            for (const c of payload.comments || []) {
-              parts.push("", `---`, "", `**\`${c.path}:${c.line}\`**`, "", c.body);
-            }
-            writeFileSync(process.argv[2], parts.join("\n") + "\n");
-          ' "$REVIEW_PAYLOAD" "$RUNNER_TEMP/reviewbrief/comment.md"
-          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/reviewbrief/comment.md"
-          echo "Posted gated summary comment with $INLINE_COUNT finding(s)."
+        node --experimental-strip-types "$ACTION_PATH/scripts/attach-replies.ts" \
+          --brief "$BRIEF_PATH" --targets "$TARGETS" --comments "$COMMENTS"
+
+    - name: Upload fix brief
+      id: upload
+      if: steps.review.outputs.has_brief == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: fix-brief-pr-${{ github.event.pull_request.number }}
+        path: ${{ steps.review.outputs.brief_path }}
+        retention-days: 14
+
+    - name: Link fix brief on review
+      if: steps.review.outputs.has_brief == 'true' && steps.post.outputs.posted == 'true' && steps.post.outputs.review_id != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        REVIEW_ID: ${{ steps.post.outputs.review_id }}
+        REVIEW_PAYLOAD: ${{ steps.review.outputs.review_payload_path }}
+        BRIEF_URL: ${{ steps.upload.outputs.artifact-url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${BRIEF_URL:-}" ]; then
+          echo "No artifact URL; skipping review body patch."
+          exit 0
         fi
+        PATCH="$RUNNER_TEMP/reviewbrief/review-body-patch.json"
+        node --input-type=module -e '
+          import { readFileSync, writeFileSync } from "node:fs";
+          const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
+          const url = process.argv[2];
+          const line = `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`;
+          const body = `${payload.body.trimEnd()}\n\n${line}\n`;
+          writeFileSync(process.argv[3], JSON.stringify({ body }));
+        ' "$REVIEW_PAYLOAD" "$BRIEF_URL" "$PATCH"
+        gh api --method PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null
+        echo "Patched review $REVIEW_ID with fix-brief download link."
+
+    - name: Upload debug artifacts
+      if: always() && inputs.debug-artifacts == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: reviewbrief-debug-pr-${{ github.event.pull_request.number }}
+        path: |
+          ${{ runner.temp }}/reviewbrief/findings.json
+          ${{ runner.temp }}/reviewbrief/review-payload.json
+          ${{ runner.temp }}/reviewbrief/fix-brief-targets.json
+          ${{ runner.temp }}/reviewbrief/scope.txt
+        retention-days: 7
+        if-no-files-found: ignore

@@ -144,38 +144,31 @@ echo "Review:     $OUT/review.md"
 if [ "$POST" -eq 1 ]; then
   [ -s "$OUT/review-payload.json" ] || die "review-payload.json is missing; cannot post"
 
-  # Mirror the Action: when a fix brief exists, publish it and link it from the review.
-  # Secret gists are unlisted but reachable by anyone with the URL (same as artifact links).
-  if [ -f "$OUT/fix-brief.md" ]; then
-    echo "Uploading fix-brief.md as a secret gist..."
-    # Copy to a named temp file so the gist shows fix-brief-pr-<N>.md (gh uses the basename).
-    BRIEF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/reviewbrief-gist.XXXXXX")" || die "mktemp failed"
-    BRIEF_COPY="$BRIEF_DIR/fix-brief-pr-${PR}.md"
-    cp "$OUT/fix-brief.md" "$BRIEF_COPY"
-    GIST_OUT="$(gh gist create \
-      --desc "ReviewBrief fix brief for ${REPO} PR #${PR}" \
-      "$BRIEF_COPY")" \
-      || { rm -rf "$BRIEF_DIR"; die "failed to create gist for fix-brief.md"; }
-    rm -rf "$BRIEF_DIR"
-    BRIEF_URL="$(printf '%s\n' "$GIST_OUT" | grep -E '^https://gist\.github\.com/' | tail -n1)"
-    [ -n "$BRIEF_URL" ] || die "gh gist create did not print a gist URL (got: $GIST_OUT)"
-    node --input-type=module -e '
-      import { readFileSync, writeFileSync } from "node:fs";
-      const path = process.argv[1], url = process.argv[2];
-      const payload = JSON.parse(readFileSync(path, "utf8"));
-      payload.body = `${payload.body.trimEnd()}\n\n**Fix brief for an AI assistant:** [download fix-brief.md](${url})\n`;
-      writeFileSync(path, JSON.stringify(payload, null, 2));
-    ' "$OUT/review-payload.json" "$BRIEF_URL"
-    printf '%s\n' "$BRIEF_URL" > "$OUT/fix-brief-url.txt"
-    echo "Fix brief gist: $BRIEF_URL"
-  fi
-
   INLINE_COUNT="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).comments.length)' "$OUT/review-payload.json")"
   # Always post the gated payload (never the ungated review.md dump). Prefer a
   # PR review; if create-review fails, post the payload body (+ inline text).
+  # Post first so inline comment ids exist, then attach report-back commands to
+  # fix-brief.md, upload the gist, and finally patch the review with the download link.
   echo "Posting gated PR review ($INLINE_COUNT inline comment(s))..."
-  if gh api --method POST "repos/$REPO/pulls/$PR/reviews" --input "$OUT/review-payload.json" >/dev/null; then
-    echo "Posted PR review."
+  REVIEW_ID=""
+  echo "[]" > "$OUT/posted-comments.json"
+  if REVIEW_JSON="$(gh api --method POST "repos/$REPO/pulls/$PR/reviews" --input "$OUT/review-payload.json")"; then
+    REVIEW_ID="$(printf '%s' "$REVIEW_JSON" | node --input-type=module -e 'import { readFileSync } from "node:fs"; console.log(JSON.parse(readFileSync(0,"utf8")).id || "")')"
+    echo "Posted PR review${REVIEW_ID:+ (id $REVIEW_ID)}."
+    if [ -n "$REVIEW_ID" ]; then
+      if RAW="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID/comments")"; then
+        printf '%s' "$RAW" | node --input-type=module -e '
+          import { readFileSync, writeFileSync } from "node:fs";
+          const raw = readFileSync(0, "utf8").trim();
+          let rows = [];
+          try { rows = JSON.parse(raw || "[]"); } catch { rows = []; }
+          if (!Array.isArray(rows)) rows = [];
+          writeFileSync(process.argv[1], JSON.stringify(rows.map((c) => ({
+            id: c.id, body: c.body || "", path: c.path, line: c.line ?? null,
+          })), null, 2));
+        ' "$OUT/posted-comments.json"
+      fi
+    fi
   else
     echo "create-review failed; posting gated payload as an issue comment..."
     node --input-type=module -e '
@@ -189,7 +182,48 @@ if [ "$POST" -eq 1 ]; then
     ' "$OUT/review-payload.json" "$OUT/comment.md"
     gh pr comment "$PR" ${GH_REPO[@]+"${GH_REPO[@]}"} --body-file "$OUT/comment.md" >/dev/null
   fi
+
+  if [ -f "$OUT/fix-brief.md" ] && [ -f "$OUT/fix-brief-targets.json" ]; then
+    node --experimental-strip-types "$HERE/attach-replies.ts" \
+      --brief "$OUT/fix-brief.md" --targets "$OUT/fix-brief-targets.json" \
+      --comments "$OUT/posted-comments.json"
+  fi
+
+  # Secret gists are unlisted but reachable by anyone with the URL (same as artifact links).
+  if [ -f "$OUT/fix-brief.md" ]; then
+    echo "Uploading fix-brief.md as a secret gist..."
+    BRIEF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/reviewbrief-gist.XXXXXX")" || die "mktemp failed"
+    BRIEF_COPY="$BRIEF_DIR/fix-brief-pr-${PR}.md"
+    cp "$OUT/fix-brief.md" "$BRIEF_COPY"
+    GIST_OUT="$(gh gist create \
+      --desc "ReviewBrief fix brief for ${REPO} PR #${PR}" \
+      "$BRIEF_COPY")" \
+      || { rm -rf "$BRIEF_DIR"; die "failed to create gist for fix-brief.md"; }
+    rm -rf "$BRIEF_DIR"
+    BRIEF_URL="$(printf '%s\n' "$GIST_OUT" | grep -E '^https://gist\.github\.com/' | tail -n1)"
+    [ -n "$BRIEF_URL" ] || die "gh gist create did not print a gist URL (got: $GIST_OUT)"
+    printf '%s\n' "$BRIEF_URL" > "$OUT/fix-brief-url.txt"
+    echo "Fix brief gist: $BRIEF_URL"
+    if [ -n "$REVIEW_ID" ]; then
+      PATCH="$OUT/review-body-patch.json"
+      node --input-type=module -e '
+        import { readFileSync, writeFileSync } from "node:fs";
+        const payload = JSON.parse(readFileSync(process.argv[1], "utf8"));
+        const url = process.argv[2];
+        const line = `**Fix brief for an AI assistant:** [download fix-brief.md](${url})`;
+        writeFileSync(process.argv[3], JSON.stringify({ body: `${payload.body.trimEnd()}\n\n${line}\n` }));
+      ' "$OUT/review-payload.json" "$BRIEF_URL" "$PATCH"
+      gh api --method PUT "repos/$REPO/pulls/$PR/reviews/$REVIEW_ID" --input "$PATCH" >/dev/null \
+        || echo "warning: could not patch review body with fix-brief link"
+    fi
+  fi
   echo "Posted the review to $URL"
 else
+  if [ -f "$OUT/fix-brief.md" ] && [ -f "$OUT/fix-brief-targets.json" ]; then
+    echo "[]" > "$OUT/posted-comments.json"
+    node --experimental-strip-types "$HERE/attach-replies.ts" \
+      --brief "$OUT/fix-brief.md" --targets "$OUT/fix-brief-targets.json" \
+      --comments "$OUT/posted-comments.json"
+  fi
   echo "Not posted (re-run with --post to publish the review)."
 fi

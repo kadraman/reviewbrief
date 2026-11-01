@@ -126,8 +126,14 @@ test("e2e: two consistency runs reward agreement, penalise one-run findings, and
       assert.equal(file.findings.find((s: any) => s.title === "A").inline, true);
       const payload = JSON.parse(readFileSync(join(out, "review-payload.json"), "utf8"));
       assert.equal(payload.comments.length, 2);
-      assert.match(payload.body, /\*\*Once\*\*/);
-      assert.match(payload.body, /\*\*A\*\*/);
+      assert.match(payload.body, /## Pull request overview/);
+      assert.match(payload.body, /generated 2 comments/);
+      // Findings live on inline threads (not duplicated in the overview list).
+      const bodies = payload.comments.map((c: { body: string }) => c.body).join("\n");
+      assert.match(bodies, /\*\*Once\*\*/);
+      assert.match(bodies, /\*\*A\*\*/);
+      assert.match(bodies, /<div align="right"><b>High<\/b><\/div>/);
+      assert.doesNotMatch(bodies, /% confidence/);
       assert.deepEqual(seen.map((body) => body.temperature), [0, 0.4]);
     });
 });
