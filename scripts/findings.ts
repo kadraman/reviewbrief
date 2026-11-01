@@ -214,10 +214,25 @@ export function repairFindingsPrompt(rejected: RejectedFinding[]): string {
 
 export function parseFindings(response: string): Finding[] { return parseResponse(response).findings; }
 
+/** Hidden HTML marker so a later step can match an inline thread to a finding id. */
+export function findingMarker(id: string): string {
+  return `<!-- reviewbrief:${id.replace(/-->/g, "")} -->`;
+}
+
+/** Extract the finding id from a comment body that contains a reviewbrief marker. */
+export function parseFindingMarker(body: string): string | undefined {
+  const match = /<!--\s*reviewbrief:([^\s-->][^>]*)\s*-->/.exec(body);
+  return match?.[1]?.trim() || undefined;
+}
+
+function severityLabel(severity: FindingSeverity): string {
+  return severity.charAt(0).toUpperCase() + severity.slice(1);
+}
+
 /** Render one concise, bounded GitHub review comment. Prefer keeping a GitHub suggestion by shrinking prose first. */
 export function renderFinding(finding: Finding, maxLength = 800): string {
-  // Compact chrome so more of the budget goes to the suggestion / explanation.
-  const header = `${icons[finding.severity]} **${finding.category[0].toUpperCase()}${finding.category.slice(1)}**`;
+  // Copilot-style: severity top-right, prose body, optional suggestion. No confidence percentage.
+  const marker = findingMarker(finding.id);
   const fullTitle = finding.title.trim();
   const fullDescription = finding.description.trim();
   const fullRecommendation = finding.recommendation?.trim() ?? "";
@@ -226,18 +241,15 @@ export function renderFinding(finding: Finding, maxLength = 800): string {
   let recommendation = fullRecommendation;
   const suggestion = finding.suggestion?.trimEnd() ?? "";
   let suggestionNote = "";
-  const confidence = `${Math.round(finding.confidence * 100)}% confidence`;
-  const lineRange = Number.isInteger(finding.endLine) && (finding.endLine as number) >= finding.line
-    ? `${finding.line}-${finding.endLine}` : `${finding.line}`;
-  const location = `\`${finding.file.replace(/`/g, "\\`")}:${lineRange}\``;
   const suggestionFence = fenceFor(suggestion);
+  const severity = `<div align="right"><b>${severityLabel(finding.severity)}</b></div>`;
 
   const compose = (includeSuggestion: boolean) => {
-    const parts = [header, "", `**${title}**`, "", location, "", description];
+    const parts = [severity, "", `**${title}**`, "", description];
     if (recommendation) parts.push("", `**Fix:** ${recommendation}`);
     if (includeSuggestion && suggestion) parts.push("", `${suggestionFence}suggestion`, suggestion, suggestionFence);
     if (suggestionNote) parts.push("", suggestionNote);
-    parts.push("", confidence);
+    parts.push("", marker);
     return parts.join("\n");
   };
 
@@ -271,7 +283,10 @@ export function renderFinding(finding: Finding, maxLength = 800): string {
     recommendation = fullRecommendation;
     body = shrinkProse(false);
   }
-  return body.length <= maxLength ? body : `${body.slice(0, maxLength - 1)}…`;
+  if (body.length <= maxLength) return body;
+  // Keep the marker when truncating so thread matching still works.
+  const budget = Math.max(0, maxLength - marker.length - 2);
+  return `${body.slice(0, budget).replace(/\n[^\n]*$/, "").trimEnd()}\n\n${marker}`;
 }
 
 function shorten(value: string, length: number): string {
@@ -300,14 +315,6 @@ function findingFingerprint(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line, finding.category, finding.title]);
 }
 
-function findingBullet(finding: Finding): string {
-  const icon = icons[finding.severity];
-  const range = Number.isInteger(finding.endLine) && (finding.endLine as number) > finding.line
-    ? `${finding.line}-${finding.endLine}` : `${finding.line}`;
-  const title = finding.title.replace(/\s+/g, " ").trim();
-  return `- ${icon} **${title}** (\`${finding.file}:${range}\`)`;
-}
-
 /** Title, location, description, and recommendation for overview-only (non-inline) findings. */
 function summaryFindingBullet(finding: Finding): string {
   const icon = icons[finding.severity];
@@ -324,17 +331,99 @@ function summaryFindingBullet(finding: Finding): string {
   return lines.join("\n");
 }
 
+/** One changed file as shown in the Copilot-style overview / per-file summary. */
+export interface OverviewFile {
+  path: string;
+  /** Whether the file was included in a reviewed batch. */
+  reviewed: boolean;
+  /** Inline comments generated for this file. */
+  comments: number;
+  /** Optional reason the file was skipped (lockfile, binary, over max-batches). */
+  note?: string;
+}
+
 export interface OverviewSections {
   unanchored?: Finding[];
   capped?: Finding[];
   /** Scored findings that did not meet the publish gate (severity/confidence). */
   belowGateCount?: number;
+  /** Pull request title used in the overview. */
+  title?: string;
+  /** Pull request body (truncated); first paragraph / Changes list are extracted when present. */
+  body?: string;
+  /** Changed files with review status for the Copilot-style summary. */
+  files?: OverviewFile[];
 }
 
 /** Whether the payload has anything worth posting (inline comments or gated summary sections). */
 export function payloadHasContent(payload: GitHubReviewPayload): boolean {
   if (payload.comments.length > 0) return true;
   return /### Could not place inline|### Over the inline cap/.test(payload.body);
+}
+
+const CHANGES_CAP = 20;
+
+/** First non-heading, non-list paragraph from a PR body. */
+export function firstOverviewParagraph(body: string): string {
+  const lines = body.replace(/\r\n/g, "\n").split("\n");
+  const chunk: string[] = [];
+  let started = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!started) {
+      if (!trimmed || /^#{1,6}\s/.test(trimmed) || /^[-*+]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) continue;
+      started = true;
+      chunk.push(trimmed);
+      continue;
+    }
+    if (!trimmed) break;
+    if (/^#{1,6}\s/.test(trimmed) || /^[-*+]\s/.test(trimmed) || /^\d+\.\s/.test(trimmed)) break;
+    chunk.push(trimmed);
+  }
+  return chunk.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/** Bullet lines under a Changes heading in the PR body, when present. */
+export function changesBulletsFromBody(body: string): string[] {
+  const text = body.replace(/\r\n/g, "\n");
+  const match = /(?:^|\n)#{1,6}\s*Changes\s*\n([\s\S]*?)(?=\n#{1,6}\s|\n---\s*\n|$)/i.exec(text)
+    ?? /(?:^|\n)\*\*Changes:?\*\*:?\s*\n([\s\S]*?)(?=\n#{1,6}\s|\n\*\*[A-Z]|\n---\s*\n|$)/i.exec(text);
+  if (!match) return [];
+  return match[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[-*+]\s+\S/.test(line) || /^\d+\.\s+\S/.test(line))
+    .map((line) => line.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "").trim())
+    .filter(Boolean);
+}
+
+function changeBullets(sections: OverviewSections): string[] {
+  const fromBody = changesBulletsFromBody(sections.body ?? "");
+  if (fromBody.length) {
+    if (fromBody.length <= CHANGES_CAP) return fromBody.map((item) => `- ${item}`);
+    return [
+      ...fromBody.slice(0, CHANGES_CAP).map((item) => `- ${item}`),
+      `- _and ${fromBody.length - CHANGES_CAP} more_`,
+    ];
+  }
+  const files = sections.files ?? [];
+  if (!files.length) return ["- _(no file list available)_"];
+  if (files.length <= CHANGES_CAP) {
+    return files.map((file) => `- \`${file.path.replace(/`/g, "\\`")}\``);
+  }
+  return [
+    ...files.slice(0, CHANGES_CAP).map((file) => `- \`${file.path.replace(/`/g, "\\`")}\``),
+    `- _and ${files.length - CHANGES_CAP} more_`,
+  ];
+}
+
+function perFileSummaryLine(file: OverviewFile): string {
+  const path = `\`${file.path.replace(/`/g, "\\`")}\``;
+  if (!file.reviewed) {
+    return `- ${path}: not reviewed${file.note ? ` (${file.note})` : ""}`;
+  }
+  const n = file.comments;
+  return `- ${path}: reviewed, ${n} comment${n === 1 ? "" : "s"}`;
 }
 
 /** Build the create-review overview body shown above the inline comment threads. */
@@ -346,10 +435,26 @@ export function reviewOverviewBody(
   const unanchored = sections.unanchored ?? [];
   const capped = sections.capped ?? [];
   const belowGateCount = sections.belowGateCount ?? 0;
-  const parts = ["## ReviewBrief", ""];
+  const files = sections.files ?? [];
+  const reviewedCount = files.filter((file) => file.reviewed).length;
+  const totalFiles = files.length;
+  const commentCount = inline.length;
+  const title = (sections.title ?? "").trim();
+  const paragraph = firstOverviewParagraph(sections.body ?? "");
+
+  const parts = ["## Pull request overview", ""];
+  if (title) parts.push(title, "");
+  if (paragraph) parts.push(paragraph, "");
+  parts.push("**Changes:**", "", ...changeBullets(sections), "");
+  parts.push(
+    "**Reviewed changes**",
+    "",
+    `ReviewBrief reviewed ${reviewedCount} out of ${totalFiles || reviewedCount || "?"} changed file${(totalFiles || reviewedCount) === 1 ? "" : "s"} in this pull request and generated ${commentCount} comment${commentCount === 1 ? "" : "s"}.`,
+    "",
+  );
   if (!inline.length) {
     parts.push(
-      `No inline findings met the gate (critical/high with confidence ≥ ${minimumConfidence}).`,
+      `_No inline findings met the publish gate (critical/high at or above the confidence floor)._`,
       "",
     );
     if (belowGateCount > 0) {
@@ -358,25 +463,20 @@ export function reviewOverviewBody(
         "",
       );
     }
-  } else {
-    const bySeverity = new Map<FindingSeverity, number>();
-    for (const finding of inline) {
-      bySeverity.set(finding.severity, (bySeverity.get(finding.severity) ?? 0) + 1);
-    }
-    const counts = severities
-      .filter((severity) => bySeverity.has(severity))
-      .map((severity) => `| ${severity} | ${bySeverity.get(severity)} |`);
+  }
+  if (files.length) {
     parts.push(
-      `${inline.length} inline finding${inline.length === 1 ? "" : "s"} (critical/high with confidence ≥ ${minimumConfidence}).`,
+      "<details>",
+      "<summary>Show a summary per file</summary>",
       "",
-      "| Severity | Count |",
-      "|---|---|",
-      ...counts,
+      ...files.map(perFileSummaryLine),
       "",
-      ...inline.map(findingBullet),
+      "</details>",
       "",
     );
   }
+  // minimumConfidence is part of the gate; kept in the signature for call-site compatibility.
+  void minimumConfidence;
   if (unanchored.length) {
     parts.push(
       "### Could not place inline",
@@ -508,6 +608,7 @@ export function githubReviewPayload(
   render: (finding: Finding) => string = renderFinding,
   unanchored: Finding[] = [],
   requireMultiRun = false,
+  overview: Pick<OverviewSections, "title" | "body" | "files"> = {},
 ): GitHubReviewPayload {
   const published = publishableFindings(anchored, unanchored, minimumConfidence, maxComments, requireMultiRun);
   const belowGateCount = Math.max(0, anchored.length + unanchored.length - published.all.length);
@@ -517,8 +618,52 @@ export function githubReviewPayload(
       unanchored: published.unanchored,
       capped: published.capped,
       belowGateCount,
+      title: overview.title,
+      body: overview.body,
+      files: overview.files,
     }),
     comments: published.inline.map((finding) => toReviewComment(finding, render(finding))),
+  };
+}
+
+/** Targets written beside fix-brief.md so a later step can attach reply commands. */
+export interface FixBriefTarget {
+  id: string;
+  severity: FindingSeverity;
+  file: string;
+  line: number;
+  endLine?: number;
+  title: string;
+  /** True when the finding was posted as an inline review comment. */
+  inline: boolean;
+}
+
+export interface FixBriefTargetsFile {
+  schemaVersion: 1;
+  repo: string;
+  pr: string;
+  targets: FixBriefTarget[];
+}
+
+export function buildFixBriefTargets(
+  findings: Finding[],
+  inlineIds: Set<string>,
+  repo: string,
+  pr: string,
+): FixBriefTargetsFile {
+  return {
+    schemaVersion: 1,
+    repo,
+    pr,
+    targets: findings.map((finding) => ({
+      id: finding.id,
+      severity: finding.severity,
+      file: finding.file,
+      line: finding.line,
+      endLine: finding.endLine,
+      title: finding.title,
+      inline: inlineIds.has(finding.id),
+    })),
   };
 }
 

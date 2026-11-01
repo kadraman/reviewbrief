@@ -6,8 +6,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { annotateDiff, anchorFindings, parseDiffLines } from "./difflines.ts";
 import {
-  FIX_BRIEF_MEDIUM_CONFIDENCE, fixBriefFindings, githubReviewPayload, parseResponse, partitionInline,
-  rankFindings, renderFinding, repairFindingsPrompt, type Finding,
+  FIX_BRIEF_MEDIUM_CONFIDENCE, buildFixBriefTargets, fixBriefFindings, githubReviewPayload,
+  parseResponse, partitionInline, rankFindings, renderFinding, repairFindingsPrompt,
+  type Finding, type OverviewFile,
 } from "./findings.ts";
 import { clusterRuns, scoreFinding } from "./confidence.ts";
 import { contextOptionsFromEnv, createContextBuilder, type ContextBuilder } from "./context.ts";
@@ -332,7 +333,8 @@ async function makeFixBrief(config: LlmConfig, ctx: Context, final: string): Pro
       "2. For each finding, open the referenced file and **verify the problem is real** before changing anything. If it is not real, or you cannot tell, skip it and explain why.",
       "3. Make the smallest change that fixes each verified problem. Do not refactor, reformat, or touch unrelated code.",
       "4. Run the project's existing tests and linters after your changes, and fix anything you broke.",
-      "5. Finish with a short report: which findings you fixed, which you skipped, and why.", "", "## Findings", "",
+      "5. For **every** finding, leave a short comment on the pull request describing what you changed, or why you skipped it. Use the commands in the **Report back** section at the end of this file (reply on the matching review thread when a comment id is listed; otherwise post a new PR comment). Do not stop at a chat-only summary.",
+      "", "## Findings", "",
     ];
     console.log("Fix brief generated.");
     return `${header.join("\n")}${findings.trim()}\n`;
@@ -340,6 +342,41 @@ async function makeFixBrief(config: LlmConfig, ctx: Context, final: string): Pro
     console.error(`fix brief generation failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
+}
+
+/** Strip ` (part i/n)` suffixes so overview rows use the real path. */
+function baseFileLabel(label: string): string {
+  return label.replace(/ \(part \d+\/\d+\)$/, "");
+}
+
+/** Build the Copilot-style per-file overview rows from pieces, skips, and inline findings. */
+function overviewFiles(
+  pieces: Piece[], skipped: string[], unreviewed: string[], inline: Finding[],
+): OverviewFile[] {
+  const byPath = new Map<string, OverviewFile>();
+  const ensure = (path: string): OverviewFile => {
+    let row = byPath.get(path);
+    if (!row) {
+      row = { path, reviewed: false, comments: 0 };
+      byPath.set(path, row);
+    }
+    return row;
+  };
+  for (const piece of pieces) ensure(baseFileLabel(piece.label)).reviewed = true;
+  for (const label of unreviewed) {
+    const row = ensure(baseFileLabel(label));
+    row.reviewed = false;
+    row.note = row.note ?? "exceeded max-batches";
+  }
+  for (const entry of skipped) {
+    const path = entry.replace(/ \([^)]*\)$/, "");
+    const note = /\(([^)]*)\)\s*$/.exec(entry)?.[1];
+    const row = ensure(path);
+    row.reviewed = false;
+    if (note) row.note = note;
+  }
+  for (const finding of inline) ensure(finding.file).comments += 1;
+  return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 function withTemperature(config: LlmConfig, temperature: string): LlmConfig {
   const args = [...config.args] as LlmConfig["args"];
@@ -461,8 +498,11 @@ async function main(): Promise<number> {
   if (runCount > 1 && !agreementOn) {
     console.log("::warning::A batch failed in a consistency run; agreement scoring is disabled for this review.");
   }
-  const findings: Finding[] = clusterRuns(perRun).map(({ finding, found }) =>
-    scoreFinding(finding, lineMap, agreementOn ? { found, runs: runCount } : undefined));
+  // Stable unique ids so inline markers and fix-brief report-back targets match 1:1.
+  const findings: Finding[] = clusterRuns(perRun).map(({ finding, found }, index) => ({
+    ...scoreFinding(finding, lineMap, agreementOn ? { found, runs: runCount } : undefined),
+    id: `RB${index + 1}`,
+  }));
   const safeRender = (finding: Finding): string => {
     try { return renderFinding(finding); }
     catch (error) {
@@ -477,8 +517,13 @@ async function main(): Promise<number> {
   // When agreement scoring is on, one-off medium findings stay out of the fix brief.
   // Critical/high that clear the confidence floor still publish (agreement only adjusts the score).
   const requireMultiRun = agreementOn;
+  const { inline: inlineFindings } = partitionInline(
+    anchored, minimumConfidence, maxInlineComments, requireMultiRun,
+  );
+  const files = overviewFiles(pieces, skipped, unreviewed, inlineFindings);
   const payload = githubReviewPayload(
     anchored, minimumConfidence, maxInlineComments, safeRender, unanchored, requireMultiRun,
+    { title: ctx.title, body: ctx.body, files },
   );
   const reviewScope = env("REVIEW_SCOPE");
   const footer = [`_Reviewed ${pieces.length} diff pieces in ${batches.length} API call(s) with \`${model}\` (${provider})._`];
@@ -493,9 +538,8 @@ async function main(): Promise<number> {
   if (dropped) footer.push(`${dropped} malformed finding(s) were discarded.`);
   if (runCount > 1 && !agreementOn) footer.push("Consistency runs: a batch failed in at least one extra run, so agreement scoring was not applied.");
   const keyOf = (s: Finding) => `${s.file}\u0000${s.line}\u0000${s.title}`;
-  const inlineKeys = new Set(
-    partitionInline(anchored, minimumConfidence, maxInlineComments, requireMultiRun).inline.map(keyOf),
-  );
+  const inlineKeys = new Set(inlineFindings.map(keyOf));
+  const inlineIds = new Set(inlineFindings.map((finding) => finding.id));
   const records = [
     ...anchored.map((s) => ({ ...s, anchored: true, inline: inlineKeys.has(keyOf(s)) })),
     ...unanchored.map((s) => ({ ...s, anchored: false, inline: false })),
@@ -511,6 +555,8 @@ async function main(): Promise<number> {
   payload.body = `${payload.body.trimEnd()}\n\n---\n${footer.join("\n\n")}\n`;
   writeFileSync(join(args.outDir, "review-payload.json"), JSON.stringify(payload, null, 2));
   let output = `## ReviewBrief\n\n${final}\n\n---\n${footer.join("\n\n")}`;
+  const targetsPath = join(args.outDir, "fix-brief-targets.json");
+  if (existsSync(targetsPath)) rmSync(targetsPath);
   if (env("FIX_BRIEF", "true").toLowerCase() === "true" && !flags.has("--no-fix-brief")) {
     const fixBriefMediumConfidence = Number(env("FIX_BRIEF_MEDIUM_CONFIDENCE", String(FIX_BRIEF_MEDIUM_CONFIDENCE)));
     const forBriefFindings = fixBriefFindings(
@@ -522,7 +568,12 @@ async function main(): Promise<number> {
     const brief = forBrief === "NO_ACTIONABLE_FINDINGS"
       ? null
       : await makeFixBrief(config, ctx, forBrief);
-    if (brief) writeFileSync(briefPath, brief);
+    if (brief) {
+      writeFileSync(briefPath, brief);
+      writeFileSync(targetsPath, JSON.stringify(
+        buildFixBriefTargets(forBriefFindings, inlineIds, ctx.repo, ctx.pr), null, 2,
+      ));
+    }
   }
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${output}\n`);
   if (output.length > 60000) output = `${output.slice(0, 58000).replace(/\n[^\n]*$/, "")}\n\n_Review continues in the workflow run's job summary (too long for a comment)._`;
